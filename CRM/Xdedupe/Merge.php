@@ -256,26 +256,53 @@ class CRM_Xdedupe_Merge
             }
             
             // Check for conflicts before merging
-            $conflicts = civicrm_api3('Contact', 'getmergeconflicts', [
-                'main_id' => $main_contact_id,
-                'other_id' => $other_contact_id
-            ]);
-            
-            if (!empty($conflicts['values'])) {
-                $this->addMergeDetail(E::ts("Found conflicts before merge:"));
-                foreach ($conflicts['values'] as $conflict) {
-                    $this->addMergeDetail(E::ts("- %1", [1 => $conflict]));
-                }
+            try {
+                $conflicts = civicrm_api3('Contact', 'get_merge_conflicts', [
+                    'to_keep_id' => $main_contact_id,
+                    'to_remove_id' => $other_contact_id
+                ]);
                 
+                if (!empty($conflicts['values'])) {
+                    $this->addMergeDetail(E::ts("Found conflicts before merge:"));
+                    foreach ($conflicts['values'] as $merge_mode => $conflict_data) {
+                        if (!empty($conflict_data['conflicts'])) {
+                            foreach ($conflict_data['conflicts'] as $entity => $entity_conflicts) {
+                                foreach ($entity_conflicts as $field_name => $field_conflict) {
+                                    $this->addMergeDetail(
+                                        E::ts(
+                                            "Potential conflict in %1: %2",
+                                            [
+                                                1 => $entity,
+                                                2 => $field_conflict['title']
+                                            ]
+                                        )
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (!$force_merge) {
+                        throw new Exception("Merge aborted due to conflicts");
+                    }
+                }
+            } catch (Exception $e) {
+                // If the API call fails, log it but continue if force_merge is true
+                $this->addMergeDetail(
+                    E::ts(
+                        "WARNING: Could not check for conflicts: %1",
+                        [1 => $e->getMessage()]
+                    )
+                );
                 if (!$force_merge) {
-                    throw new Exception("Merge aborted due to conflicts");
+                    throw $e;
                 }
             }
             
             // Perform the merge
             $result = civicrm_api3('Contact', 'merge', [
-                'main_id' => $main_contact_id,
-                'other_id' => $other_contact_id,
+                'to_keep_id' => $main_contact_id,
+                'to_remove_id' => $other_contact_id,
                 'mode' => $force_merge ? 'aggressive' : 'safe'
             ]);
             

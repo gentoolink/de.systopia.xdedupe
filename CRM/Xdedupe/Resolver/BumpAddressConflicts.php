@@ -58,9 +58,6 @@ class CRM_Xdedupe_Resolver_BumpAddressConflicts extends CRM_Xdedupe_Resolver
     /**
      * Resolve the merge conflicts by editing the contact
      *
-     * CAUTION: IT IS PARAMOUNT TO UNLOAD A CONTACT FROM THE CACHE IF CHANGED AS FOLLOWS:
-     *  $this->merge->unloadContact($contact_id)
-     *
      * @param $main_contact_id    int     the main contact ID
      * @param $other_contact_ids  array   other contact IDs
      * @return boolean TRUE, if there was a conflict to be resolved
@@ -68,53 +65,163 @@ class CRM_Xdedupe_Resolver_BumpAddressConflicts extends CRM_Xdedupe_Resolver
      */
     public function resolve($main_contact_id, $other_contact_ids)
     {
-        // get main contact's phones
-        $main_contact_addresses = $this->getContactAddresses($main_contact_id);
-        if ($this->containsConflictAddress($main_contact_addresses)) {
-            // if there already is a conflict address, there's nothing we can do
-            return false;
-        }
-
-        // compare to the other contacts:
-        foreach ($other_contact_ids as $other_contact_id) {
-            $other_contact_addresses = $this->getContactAddresses($other_contact_id);
-            if ($this->containsConflictAddress($other_contact_addresses)) {
-                // if there already is a conflict address, there's nothing we can do
-                continue;
+        $changes_made = false;
+        
+        // First, clean up any existing conflict addresses
+        try {
+            $conflict_location_type_id = CRM_Xdedupe_Config::getConflictLocationTypeID();
+            $main_contact_addresses = $this->getContactAddresses($main_contact_id);
+            
+            // Clean up main contact's conflict addresses
+            foreach ($main_contact_addresses as $address_id => $address) {
+                if ($address['location_type_id'] == $conflict_location_type_id) {
+                    // Try to find a non-conflict address of the same type
+                    $non_conflict_address = $this->findNonConflictAddress($main_contact_id, $address);
+                    if ($non_conflict_address) {
+                        // Update the conflict address to match the non-conflict one
+                        civicrm_api3('Address', 'create', [
+                            'id' => $address_id,
+                            'location_type_id' => $non_conflict_address['location_type_id'],
+                            'street_address' => $non_conflict_address['street_address'],
+                            'city' => $non_conflict_address['city'],
+                            'postal_code' => $non_conflict_address['postal_code'],
+                            'country_id' => $non_conflict_address['country_id'],
+                            'is_primary' => $address['is_primary']
+                        ]);
+                        $this->addMergeDetail(
+                            E::ts(
+                                "Updated conflict address [%1] to match existing address type",
+                                [1 => $address_id]
+                            )
+                        );
+                        $changes_made = true;
+                    }
+                }
             }
-
-            // compare all addresses
-            foreach ($main_contact_addresses as $main_address_id => $main_address) {
-                foreach ($other_contact_addresses as $other_address_id => $other_address) {
-                    if ($main_address['location_type_id'] == $other_address['location_type_id']) {
-                        // address location type clash!
-                        if (!$this->addressEquals($main_address, $other_address)) {
-                            // and they differ! -> we need to act: bump location type to conflict
-                            civicrm_api3(
-                                'Address',
-                                'create',
-                                [
-                                    'id'               => $other_address_id,
-                                    'location_type_id' => CRM_Xdedupe_Config::getConflictLocationTypeID()
-                                ]
-                            );
+            
+            // Now handle the other contacts
+            foreach ($other_contact_ids as $other_contact_id) {
+                $other_contact_addresses = $this->getContactAddresses($other_contact_id);
+                
+                // Clean up other contact's conflict addresses
+                foreach ($other_contact_addresses as $address_id => $address) {
+                    if ($address['location_type_id'] == $conflict_location_type_id) {
+                        // Try to find a non-conflict address of the same type
+                        $non_conflict_address = $this->findNonConflictAddress($other_contact_id, $address);
+                        if ($non_conflict_address) {
+                            // Update the conflict address to match the non-conflict one
+                            civicrm_api3('Address', 'create', [
+                                'id' => $address_id,
+                                'location_type_id' => $non_conflict_address['location_type_id'],
+                                'street_address' => $non_conflict_address['street_address'],
+                                'city' => $non_conflict_address['city'],
+                                'postal_code' => $non_conflict_address['postal_code'],
+                                'country_id' => $non_conflict_address['country_id'],
+                                'is_primary' => $address['is_primary']
+                            ]);
                             $this->addMergeDetail(
                                 E::ts(
-                                    "Address [%1] from contact [%2] was bumped to 'conflict' location type.",
-                                    [
-                                        1 => $other_address_id,
-                                        2 => $other_address['contact_id']
-                                    ]
+                                    "Updated conflict address [%1] to match existing address type",
+                                    [1 => $address_id]
                                 )
                             );
-                            return true; // we cannot add more 'conflict' addresses
+                            $changes_made = true;
+                        }
+                    }
+                }
+
+                // Handle address conflicts
+                foreach ($main_contact_addresses as $main_address_id => $main_address) {
+                    foreach ($other_contact_addresses as $other_address_id => $other_address) {
+                        if ($main_address['location_type_id'] == $other_address['location_type_id']) {
+                            if ($this->addressEquals($main_address, $other_address)) {
+                                // Addresses are identical - delete the duplicate
+                                try {
+                                    civicrm_api3('Address', 'delete', ['id' => $other_address_id]);
+                                    $this->addMergeDetail(
+                                        E::ts(
+                                            "Removed duplicate address [%1] from contact [%2] as it was identical to main contact's address.",
+                                            [
+                                                1 => $other_address_id,
+                                                2 => $other_contact_id
+                                            ]
+                                        )
+                                    );
+                                    $changes_made = true;
+                                    $this->merge->unloadContact($other_contact_id);
+                                } catch (Exception $e) {
+                                    $this->addMergeDetail(
+                                        E::ts(
+                                            "ERROR: Failed to remove duplicate address [%1] from contact [%2]: %3",
+                                            [
+                                                1 => $other_address_id,
+                                                2 => $other_contact_id,
+                                                3 => $e->getMessage()
+                                            ]
+                                        )
+                                    );
+                                    CRM_Core_Error::debug_log_message("XDedupe: Failed to remove duplicate address: " . $e->getMessage());
+                                }
+                            } else {
+                                // Addresses differ - mark as conflict
+                                try {
+                                    $is_primary = !empty($other_address['is_primary']);
+                                    $result = civicrm_api3(
+                                        'Address',
+                                        'create',
+                                        [
+                                            'id' => $other_address_id,
+                                            'location_type_id' => $conflict_location_type_id,
+                                            'is_primary' => $is_primary ? 1 : 0
+                                        ]
+                                    );
+                                    
+                                    if (!empty($result['is_error'])) {
+                                        throw new Exception("Failed to update address location type: " . $result['error_message']);
+                                    }
+
+                                    $this->addMergeDetail(
+                                        E::ts(
+                                            "Address [%1] from contact [%2] was bumped to 'conflict' location type (preserved primary status: %3).",
+                                            [
+                                                1 => $other_address_id,
+                                                2 => $other_address['contact_id'],
+                                                3 => $is_primary ? 'yes' : 'no'
+                                            ]
+                                        )
+                                    );
+                                    $changes_made = true;
+                                    $this->merge->unloadContact($other_contact_id);
+                                } catch (Exception $e) {
+                                    $this->addMergeDetail(
+                                        E::ts(
+                                            "ERROR: Failed to resolve address conflict for address [%1] from contact [%2]: %3",
+                                            [
+                                                1 => $other_address_id,
+                                                2 => $other_contact_id,
+                                                3 => $e->getMessage()
+                                            ]
+                                        )
+                                    );
+                                    CRM_Core_Error::debug_log_message("XDedupe: Address conflict resolution failed: " . $e->getMessage());
+                                }
+                            }
                         }
                     }
                 }
             }
+        } catch (Exception $e) {
+            $this->addMergeDetail(
+                E::ts(
+                    "ERROR: Address conflict resolution failed: %1",
+                    [1 => $e->getMessage()]
+                )
+            );
+            CRM_Core_Error::debug_log_message("XDedupe: Address conflict resolution failed: " . $e->getMessage());
+            throw $e;
         }
 
-        return false;
+        return $changes_made;
     }
 
     /**
@@ -133,26 +240,32 @@ class CRM_Xdedupe_Resolver_BumpAddressConflicts extends CRM_Xdedupe_Resolver
                 'contact_id'   => $contact_id,
                 'option.limit' => 0,
                 'sequential'   => 0,
-                'return'       => 'id,' . implode(',', self::$relevant_address_fields)
+                'return'       => 'id,' . implode(',', self::$relevant_address_fields) . ',is_primary'
             ]
         );
         return $query['values'];
     }
 
     /**
-     * Check if the list of addresses contain a 'conflict' address
-     * @param $addresses array list of address data
-     * @return boolean true if it does
+     * Find a non-conflict address that matches the given address
+     * 
+     * @param int $contact_id
+     * @param array $address
+     * @return array|null
      */
-    protected function containsConflictAddress($addresses)
+    protected function findNonConflictAddress($contact_id, $address)
     {
         $conflict_location_type_id = CRM_Xdedupe_Config::getConflictLocationTypeID();
-        foreach ($addresses as $address) {
-            if ($address['location_type_id'] == $conflict_location_type_id) {
-                return true;
+        $addresses = $this->getContactAddresses($contact_id);
+        
+        foreach ($addresses as $existing_address) {
+            if ($existing_address['location_type_id'] != $conflict_location_type_id &&
+                $this->addressEquals($existing_address, $address)) {
+                return $existing_address;
             }
         }
-        return false;
+        
+        return null;
     }
 
     /**

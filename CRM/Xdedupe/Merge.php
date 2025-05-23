@@ -198,140 +198,138 @@ class CRM_Xdedupe_Merge
     }
 
     /**
-     * Merge the other contact into the main contact, using
-     *  CiviCRM's merge function. Before, though, the
-     *  resovlers ar applied.
+     * Merge two contacts
      *
-     * @param $main_contact_id  int main contact ID
-     * @param $other_contact_id int other contact ID
-     * @param $part_of_tuple    boolean is this pair part of an x-tuple?
-     * @return boolean merge succeeded?
+     * @param int $main_contact_id
+     * @param int $other_contact_id
+     * @param bool $force_merge
+     * @return bool
      */
-    public function merge($main_contact_id, $other_contact_id, $part_of_tuple = false)
+    public function merge($main_contact_id, $other_contact_id, $force_merge = false)
     {
-        if ($main_contact_id == $other_contact_id) {
-            // nothing to do here
-            return false;
-        }
-
-        // isolate merge in log tables
-        $this->resetLogId();
-
-        // prepare logs + co
-        $this->resetMergeDetails();
-
-        // first: verify that the contacts are "fit" for merging
-        $this->loadContacts([$main_contact_id, $other_contact_id]);
-        $main_contact = $this->getContact($main_contact_id);
-        if (!empty($main_contact['is_deleted'])) {
-            $this->logError("Main contact [{$main_contact_id}] is deleted. This is wrong!");
-            return false;
-        }
-        $other_contact = $this->getContact($other_contact_id);
-        if (!empty($other_contact['is_deleted'])) {
-            $this->logError("Other contact [{$other_contact_id}] is deleted. This is wrong!");
-            return false;
-        }
-
         $merge_succeeded = false;
-        $transaction     = new CRM_Core_Transaction();
+        $transaction = null;
+        
         try {
-            // then: run resolvers
-            /** @var $resolver CRM_Xdedupe_Resolver */
+            // Verify contacts exist and are not deleted
+            $main_contact = civicrm_api3('Contact', 'get', [
+                'id' => $main_contact_id,
+                'is_deleted' => 0,
+                'return' => ['id', 'contact_type', 'is_deleted']
+            ]);
+            
+            if (empty($main_contact['values'])) {
+                $this->addMergeDetail(E::ts("Main contact [%1] not found or is deleted", [1 => $main_contact_id]));
+                return false;
+            }
+            
+            $other_contact = civicrm_api3('Contact', 'get', [
+                'id' => $other_contact_id,
+                'is_deleted' => 0,
+                'return' => ['id', 'contact_type', 'is_deleted']
+            ]);
+            
+            if (empty($other_contact['values'])) {
+                $this->addMergeDetail(E::ts("Other contact [%1] not found or is deleted", [1 => $other_contact_id]));
+                return false;
+            }
+            
+            // Start transaction
+            $transaction = new CRM_Core_Transaction();
+            
+            // Run pre-merge resolvers
             foreach ($this->resolvers as $resolver) {
-                $changes = $resolver->resolve($main_contact_id, [$other_contact_id]);
-                if ($changes) {
-                    $this->stats['conflicts_resolved'] += 1;
-                }
-            }
-
-            // now: run the merge
-            $result = civicrm_api3(
-                'Contact',
-                'merge',
-                [
-                    'to_keep_id'   => $main_contact_id,
-                    'to_remove_id' => $other_contact_id,
-                    'mode'         => ($this->force_merge ? '' : 'safe')
-                ]
-            );
-
-            if (count($result['values']['skipped'])) {
-                $transaction->rollback(); // merge didn't work
-                $this->stats['failed'][] = [$main_contact_id, $other_contact_id];
-                // get conflicts
-                $conflicts = [];
-                if (version_compare(CRM_Utils_System::version(), '5.18.0', '>=')) {
-                    $conflicts = civicrm_api3(
-                        'Contact',
-                        'get_merge_conflicts',
-                        [
-                            'to_keep_id'   => $main_contact_id,
-                            'to_remove_id' => $other_contact_id
-                        ]
-                    );
-                    foreach ($conflicts['values'] as $merge_mode => $conflict_data) {
-                        if (!empty($conflict_data['conflicts'])) {
-                            foreach ($conflict_data['conflicts'] as $entity => $entity_conflicts) {
-                                foreach ($entity_conflicts as $field_name => $field_conflict) {
-                                    if ($entity == 'contact') {
-                                        $this->stats['errors'][] = $field_conflict['title'];
-                                    } else {
-                                        $this->stats['errors'][] = "{$field_conflict['title']} ({$entity})";
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    $this->stats['errors'][] = E::ts("unknown");
-                }
-            } elseif (count($result['values']['merged'])) {
-                // MERGE SUCCESSFUL!
                 try {
-                    // finally: run postProcessors
-                    foreach ($this->resolvers as $resolver) {
-                        $resolver->postProcess($main_contact_id, [$other_contact_id]);
-                    }
-                } catch (Exception $ex) {
-                    $transaction->rollback(); // something's wrong
-                    $this->stats['errors'][] = "Postprocessing Error: " . $ex->getMessage();
-                    $this->stats['failed'][] = [$main_contact_id, $other_contact_id];
-                    return false;
-                }
-
-                // ALL IS GOOD NOW!
-                $merge_succeeded = true;
-                $transaction->commit(); // merge worked
-                $this->stats['contacts_merged'] += 1;
-                if (!$part_of_tuple) {
-                    $this->stats['tuples_merged'] += 1;
-                }
-
-                // store merge details
-                $success = $this->updateMergeActivity($main_contact_id);
-                if (!$success) {
-                    $this->createMergeDetailNote(
-                        $main_contact_id,
-                        E::ts("Merged contact [%1] into [%2]", [1 => $other_contact_id, 2 => $main_contact_id])
+                    $resolver->resolve($main_contact_id, [$other_contact_id]);
+                } catch (Exception $e) {
+                    $this->addMergeDetail(
+                        E::ts(
+                            "ERROR: Resolver %1 failed: %2",
+                            [1 => get_class($resolver), 2 => $e->getMessage()]
+                        )
                     );
+                    CRM_Core_Error::debug_log_message("XDedupe: Resolver " . get_class($resolver) . " failed: " . $e->getMessage());
+                    if (!$force_merge) {
+                        throw $e;
+                    }
                 }
-            } else {
-                $transaction->rollback(); // this is weird
-                $this->stats['errors'][] = E::ts("Merge API Error");
-                $this->stats['failed'][] = [$main_contact_id, $other_contact_id];
             }
-        } catch (Exception $ex) {
-            $transaction->rollback(); // something's wrong
-            $this->stats['errors'][] = $ex->getMessage();
-            $this->stats['failed'][] = [$main_contact_id, $other_contact_id];
+            
+            // Check for conflicts before merging
+            $conflicts = civicrm_api3('Contact', 'getmergeconflicts', [
+                'main_id' => $main_contact_id,
+                'other_id' => $other_contact_id
+            ]);
+            
+            if (!empty($conflicts['values'])) {
+                $this->addMergeDetail(E::ts("Found conflicts before merge:"));
+                foreach ($conflicts['values'] as $conflict) {
+                    $this->addMergeDetail(E::ts("- %1", [1 => $conflict]));
+                }
+                
+                if (!$force_merge) {
+                    throw new Exception("Merge aborted due to conflicts");
+                }
+            }
+            
+            // Perform the merge
+            $result = civicrm_api3('Contact', 'merge', [
+                'main_id' => $main_contact_id,
+                'other_id' => $other_contact_id,
+                'mode' => $force_merge ? 'aggressive' : 'safe'
+            ]);
+            
+            if (!empty($result['is_error'])) {
+                throw new Exception("Merge failed: " . $result['error_message']);
+            }
+            
+            // Verify merge success
+            $other_contact_check = civicrm_api3('Contact', 'get', [
+                'id' => $other_contact_id,
+                'is_deleted' => 0
+            ]);
+            
+            if (!empty($other_contact_check['values'])) {
+                $this->addMergeDetail(E::ts("WARNING: Other contact [%1] still exists after merge", [1 => $other_contact_id]));
+                if (!$force_merge) {
+                    throw new Exception("Merge verification failed - other contact still exists");
+                }
+            }
+            
+            // Run post-merge resolvers
+            foreach ($this->resolvers as $resolver) {
+                try {
+                    $resolver->postProcess($main_contact_id);
+                } catch (Exception $e) {
+                    $this->addMergeDetail(
+                        E::ts(
+                            "WARNING: Post-process for resolver %1 failed: %2",
+                            [1 => get_class($resolver), 2 => $e->getMessage()]
+                        )
+                    );
+                    CRM_Core_Error::debug_log_message("XDedupe: Post-process for resolver " . get_class($resolver) . " failed: " . $e->getMessage());
+                }
+            }
+            
+            $merge_succeeded = true;
+            $this->addMergeDetail(E::ts("Successfully merged contact [%1] into [%2]", [1 => $other_contact_id, 2 => $main_contact_id]));
+            
+        } catch (Exception $e) {
+            $this->addMergeDetail(
+                E::ts(
+                    "ERROR: Merge failed: %1",
+                    [1 => $e->getMessage()]
+                )
+            );
+            CRM_Core_Error::debug_log_message("XDedupe: Merge failed: " . $e->getMessage());
+            
+            if ($transaction) {
+                $transaction->rollback();
+            }
+            
+            return false;
         }
-
-
-        // finally: update the stats
-        $this->unloadContact($main_contact_id);
-        $this->unloadContact($other_contact_id);
-
+        
         return $merge_succeeded;
     }
 
